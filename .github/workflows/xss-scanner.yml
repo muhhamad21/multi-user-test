@@ -1,0 +1,175 @@
+# XSS Scanner Workflow - Database-Driven Version
+# This workflow collects PR file contents and stores them in database for scanning
+
+name: XSS Security Scanner
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  xss-scan:
+    name: Scan for XSS Vulnerabilities
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # Fetch full history to get all files
+
+      - name: 🔍 XSS Scanner Registration
+        run: |
+          echo "🔍 Starting XSS Scanner..."
+          echo "Repository: ${{ github.repository }}"
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "Author: ${{ github.event.pull_request.user.login }}"
+
+      - name: 📁 Debug - List all files and verify PR branch
+        run: |
+          echo "=== Current branch/commit ==="
+          git branch -v
+          git log --oneline -n 5
+          echo "=== Repository files (first 10) ==="
+          find . -type f -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" -o -name "*.html" -o -name "*.htm" -o -name "*.java" -o -name "*.py" -o -name "*.php" -o -name "*.vue" | head -10
+          echo "=== Changed files from GitHub API ==="
+          curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            | jq -r '.[] | select(.status != "removed") | .filename'
+
+      - name: 📡 Collect PR Files and Register with XSS Scanner
+        run: |
+          echo "🔍 Collecting PR file contents..."
+
+          # Get changed files from API
+          echo "Getting changed files from GitHub API..."
+          CHANGED_FILES=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            | jq -r '.[] | select(.status != "removed") | .filename')
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Initialize files array
+          FILES_JSON="[]"
+          FILES_COUNT=0
+
+          # Process each changed file
+          for file in $CHANGED_FILES; do
+            echo "Checking file: $file"
+            
+            # Check if file exists and is relevant type
+            if [ -f "$file" ]; then
+              # Check file extension
+              case "$file" in
+                *.js|*.ts|*.jsx|*.tsx|*.html|*.htm|*.vue|*.php|*.py|*.java|*.jsp|*.jspx|*.c|*.cpp|*.cc|*.cs|*.rb|*.go|*.kt|*.scala)
+                  echo "✓ Processing $file ($(wc -c < "$file") bytes)"
+                  
+                  # Read file content and escape for JSON
+                  CONTENT=$(cat "$file" | jq -Rs .)
+                  if [ $? -eq 0 ]; then
+                    FILES_JSON=$(echo "$FILES_JSON" | jq --arg filename "$file" --argjson content "$CONTENT" \
+                      '. += [{"filename": $filename, "content": $content}]')
+                    FILES_COUNT=$((FILES_COUNT + 1))
+                    echo "✓ Added $file to files array"
+                  else
+                    echo "✗ Failed to process $file (jq error)"
+                  fi
+                  ;;
+                *)
+                  echo "- Skipping $file (not relevant file type)"
+                  ;;
+              esac
+            else
+              echo "✗ File $file not found in checkout"
+              echo "  Checking if file exists with different path..."
+              find . -name "$(basename "$file")" -type f | head -5
+            fi
+          done
+
+          echo "Total files collected: $FILES_COUNT"
+
+          # If no files collected, try to get some sample files for testing
+          if [ $FILES_COUNT -eq 0 ]; then
+            echo "No changed files found, looking for any supported files for testing..."
+            echo "This might indicate the PR branch wasn't checked out correctly."
+            echo "Available directories:"
+            find . -type d -name "dataset" -o -name "src" -o -name "lib" | head -10
+            
+            # Try to find files in common directories
+            SAMPLE_FILES=$(find . -name "*.js" -o -name "*.ts" -o -name "*.java" -o -name "*.py" -o -name "*.html" | grep -E "(dataset|src|lib)" | head -3)
+            if [ -z "$SAMPLE_FILES" ]; then
+              SAMPLE_FILES=$(find . -name "*.js" -o -name "*.ts" -o -name "*.java" -o -name "*.py" -o -name "*.html" | grep -v node_modules | head -2)
+            fi
+            
+            for file in $SAMPLE_FILES; do
+              if [ -f "$file" ]; then
+                echo "Adding sample file: $file"
+                CONTENT=$(cat "$file" | jq -Rs .)
+                FILES_JSON=$(echo "$FILES_JSON" | jq --arg filename "$file" --argjson content "$CONTENT" \
+                  '. += [{"filename": $filename, "content": $content}]')
+                FILES_COUNT=$((FILES_COUNT + 1))
+              fi
+            done
+          fi
+
+          echo "Final files count: $FILES_COUNT"
+          echo "Files JSON preview:"
+          echo "$FILES_JSON" | jq -c '.[] | {filename: .filename, size: (.content | length)}'
+
+          # Register PR with file contents
+          echo "Registering PR with XSS Scanner..."
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "https://tlnxydaetxxhwbujytal.supabase.co/functions/v1/enhanced-api/api/register-pr" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -d "$(jq -n \
+              --arg pr_number "${{ github.event.pull_request.number }}" \
+              --arg repository "${{ github.repository }}" \
+              --arg pr_title "${{ github.event.pull_request.title }}" \
+              --arg pr_url "${{ github.event.pull_request.html_url }}" \
+              --arg author "${{ github.event.pull_request.user.login }}" \
+              --arg github_token "${{ secrets.GITHUB_TOKEN }}" \
+              --arg pr_state "${{ github.event.pull_request.state }}" \
+              --arg pr_created_at "${{ github.event.pull_request.created_at }}" \
+              --argjson files "$FILES_JSON" \
+              '{
+                pr_number: ($pr_number | tonumber),
+                repository: $repository,
+                pr_title: $pr_title,
+                pr_url: $pr_url,
+                author: $author,
+                github_token: $github_token,
+                pr_state: $pr_state,
+                pr_created_at: $pr_created_at,
+                files: $files
+              }')")
+
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS:")
+
+          echo "Response status: $HTTP_STATUS"
+          echo "Response body: $BODY"
+
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Successfully registered PR with $FILES_COUNT files"
+          else
+            echo "❌ Failed to register PR (HTTP $HTTP_STATUS)"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+      - name: 💬 Post Success Comment
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -d '{
+              "body": "🚀 **XSS Scanner Registration Complete**\n\n✅ This PR has been registered with XSS Scanner Dashboard!\n\n📊 **View Results:** https://xss-scanner.netlify.app\n\n🔍 *Files have been stored in database for fast scanning.*\n\n---\n*Powered by XSS Scanner*"
+            }' || echo "Failed to post comment, continuing anyway"
